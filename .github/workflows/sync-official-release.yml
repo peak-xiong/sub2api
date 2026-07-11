@@ -1,0 +1,41 @@
+name: Sync official release
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-official-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out deployment fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch official release tags
+        run: |
+          git remote add upstream https://github.com/Wei-Shaw/sub2api.git
+          git fetch upstream --tags --force
+
+      - name: Publish latest official release for Railway
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh api repos/Wei-Shaw/sub2api/releases/latest --jq .tag_name)"
+          target="$(git rev-list -n 1 "${tag}")"
+          current="$(git ls-remote origin refs/heads/railway | cut -f1)"
+          if [[ "${current}" == "${target}" ]]; then
+            echo "Railway branch already points to ${tag} (${target})."
+            exit 0
+          fi
+          git push --force origin "${target}:refs/heads/railway"
+          echo "Published ${tag} (${target}) to the Railway deployment branch."
