@@ -32,10 +32,21 @@ jobs:
         run: |
           tag="$(gh api repos/Wei-Shaw/sub2api/releases/latest --jq .tag_name)"
           target="$(git rev-list -n 1 "${tag}")"
-          current="$(git ls-remote origin refs/heads/railway | cut -f1)"
+          git fetch origin railway:refs/remotes/origin/railway || true
+          current="$(git show origin/railway:.railway-upstream-sha 2>/dev/null || true)"
           if [[ "${current}" == "${target}" ]]; then
             echo "Railway branch already points to ${tag} (${target})."
             exit 0
           fi
-          git push --force origin "${target}:refs/heads/railway"
+          git checkout --detach "${target}"
+          sed -i \
+            's/id=sub2api-pnpm-store/id=cacheKey-sub2api-pnpm-store/' \
+            Dockerfile
+          grep -q 'id=cacheKey-sub2api-pnpm-store' Dockerfile
+          printf '%s\n' "${target}" > .railway-upstream-sha
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile .railway-upstream-sha
+          git commit -m "railway: deploy official ${tag}"
+          git push --force origin HEAD:refs/heads/railway
           echo "Published ${tag} (${target}) to the Railway deployment branch."
