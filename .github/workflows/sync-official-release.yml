@@ -7,10 +7,15 @@ on:
 
 permissions:
   contents: write
+  statuses: read
 
 concurrency:
   group: sync-official-release
   cancel-in-progress: false
+
+env:
+  RAILWAY_STATUS_CONTEXT: pure-enchantment - sub2api-app
+  SERVICE_HEALTH_URL: https://sub2.terracecapital.xyz/health
 
 jobs:
   sync:
@@ -21,32 +26,126 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fetch official release tags
-        run: |
-          git remote add upstream https://github.com/Wei-Shaw/sub2api.git
-          git fetch upstream --tags --force
-
-      - name: Publish latest official release for Railway
+      - name: Resolve official release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
           tag="$(gh api repos/Wei-Shaw/sub2api/releases/latest --jq .tag_name)"
-          target="$(git rev-list -n 1 "${tag}")"
-          git fetch origin railway:refs/remotes/origin/railway || true
-          current="$(git show origin/railway:.railway-upstream-sha 2>/dev/null || true)"
-          if [[ "${current}" == "${target}" ]]; then
-            echo "Railway branch already points to ${tag} (${target})."
-            exit 0
-          fi
-          git checkout --detach "${target}"
-          sed -i \
-            's/id=sub2api-pnpm-store/id=cacheKey-sub2api-pnpm-store/' \
-            Dockerfile
-          grep -q 'id=cacheKey-sub2api-pnpm-store' Dockerfile
-          printf '%s\n' "${target}" > .railway-upstream-sha
+          image_tag="${tag#v}"
+          image="ghcr.io/wei-shaw/sub2api:${image_tag}"
+
+          # A release can briefly appear before its container image is published.
+          for attempt in {1..12}; do
+            if docker manifest inspect "${image}" >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "${attempt}" -eq 12 ]]; then
+              echo "Official image ${image} is still unavailable." >&2
+              exit 1
+            fi
+            echo "Waiting for official image ${image} (${attempt}/12)..."
+            sleep 10
+          done
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare Railway deployment branch
+        id: prepare
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_IMAGE: ${{ steps.release.outputs.image }}
+        run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Dockerfile .railway-upstream-sha
-          git commit -m "railway: deploy official ${tag}"
-          git push --force origin HEAD:refs/heads/railway
-          echo "Published ${tag} (${target}) to the Railway deployment branch."
+          git fetch origin railway:refs/remotes/origin/railway || true
+
+          current_tag="$(git show origin/railway:.railway-version 2>/dev/null || true)"
+          if [[ "${current_tag}" == "${RELEASE_TAG}" ]]; then
+            git checkout -B railway origin/railway
+            echo "Existing Railway deployment branch already targets ${RELEASE_TAG}."
+          else
+            git checkout --orphan railway-next
+            git rm -rf .
+
+            printf 'FROM %s\n' "${RELEASE_IMAGE}" > Dockerfile
+            printf '%s\n' "${RELEASE_TAG}" > .railway-version
+            cat > README.md <<EOF
+          # Railway deployment branch
+
+          This branch is generated automatically from the latest public
+          Wei-Shaw/sub2api release. Railway deploys the prebuilt official image:
+
+          \`${RELEASE_IMAGE}\`
+          EOF
+
+            git add Dockerfile .railway-version README.md
+            git commit -m "railway: deploy official ${RELEASE_TAG}"
+          fi
+
+          echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Deploy to Railway and retry failures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          wait_for_railway() {
+            local sha="$1"
+            local state="pending"
+
+            for poll in {1..90}; do
+              state="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/status" \
+                --jq '[.statuses[] | select(.context == env.RAILWAY_STATUS_CONTEXT)] | sort_by(.updated_at) | last | .state // "pending"')"
+              echo "Railway status for ${sha:0:8}: ${state} (${poll}/90)"
+
+              case "${state}" in
+                success) return 0 ;;
+                failure|error) return 1 ;;
+              esac
+              sleep 10
+            done
+
+            echo "Timed out waiting for Railway deployment status." >&2
+            return 1
+          }
+
+          sha="$(git rev-parse HEAD)"
+          state="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/status" \
+            --jq '[.statuses[] | select(.context == env.RAILWAY_STATUS_CONTEXT)] | sort_by(.updated_at) | last | .state // "missing"')"
+
+          # A new commit has no status yet and must be pushed to trigger Railway.
+          if [[ "${state}" == "missing" ]]; then
+            git push --force origin HEAD:refs/heads/railway
+          fi
+
+          for attempt in {1..3}; do
+            if wait_for_railway "${sha}"; then
+              echo "Railway successfully deployed ${RELEASE_TAG}."
+              break
+            fi
+
+            if [[ "${attempt}" -eq 3 ]]; then
+              echo "Railway deployment failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+
+            printf '%s attempt=%s\n' "$(date -u +%FT%TZ)" "$((attempt + 1))" > .railway-retry
+            git add .railway-retry
+            git commit -m "railway: retry ${RELEASE_TAG} ($((attempt + 1))/3)"
+            sha="$(git rev-parse HEAD)"
+            git push --force origin HEAD:refs/heads/railway
+          done
+
+      - name: Verify deployed service
+        run: |
+          curl --fail --silent --show-error \
+            --retry 12 --retry-all-errors --retry-delay 5 \
+            "${SERVICE_HEALTH_URL}"
